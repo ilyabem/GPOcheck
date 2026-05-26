@@ -5,6 +5,8 @@
 **Active Directory Group Policy Object Security Analyzer**
 
 GPOCheck подключается к контроллеру домена, читает файлы GPO из SYSVOL и выявляет небезопасные настройки политик — политику паролей, блокировки, RDP, SMB, сертификаты и многое другое. Дополнительно выводит статистику пользователей и групп домена.
+
+
 За основу взят и глубоко доработан [GPOHunter](https://github.com/PShlyundin/GPOHunter).
 
 ---
