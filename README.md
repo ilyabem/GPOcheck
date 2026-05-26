@@ -1,8 +1,11 @@
-# 🔍 GPOHunter
+
+
+# 🔍 GPOCheck
 
 **Active Directory Group Policy Object Security Analyzer**
 
-GPOHunter подключается к контроллеру домена, читает файлы GPO из SYSVOL и выявляет небезопасные настройки политик — политику паролей, блокировки, RDP, SMB, сертификаты и многое другое. Дополнительно выводит статистику пользователей и групп домена.
+GPOCheck подключается к контроллеру домена, читает файлы GPO из SYSVOL и выявляет небезопасные настройки политик — политику паролей, блокировки, RDP, SMB, сертификаты и многое другое. Дополнительно выводит статистику пользователей и групп домена.
+За основу взят и глубоко доработан [GPOHunter](https://github.com/PShlyundin/GPOHunter).
 
 ---
 
@@ -34,8 +37,8 @@ GPOHunter подключается к контроллеру домена, чи�
 ## Установка
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/GPOHunter.git
-cd GPOHunter
+git clone https://github.com/YOUR_USERNAME/GPOCheck.git
+cd GPOCheck
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -138,7 +141,7 @@ python gpo_analyzer_cli.py \
 ## Пример вывода
 
 ```
-GPOHunter v1.0.0 — Active Directory GPO Security Analyzer
+GPOCheck v1.0.0 — Active Directory GPO Security Analyzer
 
 [+] Подключено к Active Directory
 [+] Найдено GPO: 5
@@ -199,7 +202,7 @@ GPOHunter v1.0.0 — Active Directory GPO Security Analyzer
 ## Структура проекта
 
 ```
-GPOHunter/
+GPOCheck/
 ├── gpo_analyzer_cli.py   # Основной CLI
 ├── gpo_decoders.py       # Декодеры GPO файлов (GptTmpl, Registry.pol, DER)
 ├── gpo_users.py          # Модуль статистики пользователей и групп

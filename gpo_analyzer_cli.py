@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GPOHunter — Active Directory GPO Security Analyzer
-https://github.com/YOUR_USERNAME/GPOHunter
+GPOCheck — Active Directory GPO Security Analyzer
+https://github.com/ilyabem/GPOCheck
 """
 
 import argparse
@@ -392,7 +392,7 @@ def read_sysvol_files(gpo_entry, dc: str, domain: str,
 # ── CLI аргументы ─────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description=f"GPOHunter v{VERSION} — Active Directory GPO Security Analyzer",
+        description=f"GPOCheck v{VERSION} — Active Directory GPO Security Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
@@ -424,7 +424,7 @@ def parse_args():
                    help="Не задавать интерактивных вопросов, использовать дефолты")
     p.add_argument("--no-color",            action="store_true",
                    help="Отключить ANSI-цвета")
-    p.add_argument("--version",             action="version", version=f"GPOHunter {VERSION}")
+    p.add_argument("--version",             action="version", version=f"GPOCheckr {VERSION}")
     # Пороги через аргументы
     g = p.add_argument_group("Пороги (переопределяют интерактивный ввод)")
     g.add_argument("--min-pwd-len",    type=int, metavar="N",
@@ -447,7 +447,7 @@ def main():
             if not attr.startswith("_"):
                 setattr(C, attr, "")
 
-    print(f"\n{C.BOLD}GPOHunter v{VERSION}{C.RST} — Active Directory GPO Security Analyzer\n")
+    print(f"\n{C.BOLD}GPOCheck v{VERSION}{C.RST} — Active Directory GPO Security Analyzer\n")
 
     # ── Пороги ───────────────────────────────────────────────────────────────
     if args.no_prompt:

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# setup.sh — быстрая установка GPOHunter
+# setup.sh — быстрая установка GPOCheck
 set -e
 
 VENV_DIR="venv"
 PYTHON="${PYTHON:-python3}"
 
 echo ""
-echo "  GPOHunter — установка"
+echo "  GPOCheck — установка"
 echo "  ─────────────────────"
 
 # Проверить python3-venv
