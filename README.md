@@ -39,7 +39,7 @@ GPOCheck подключается к контроллеру домена, чит
 ## Установка
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/GPOCheck.git
+git clone https://github.com/ilyabem/GPOCheck.git
 cd GPOCheck
 python3 -m venv venv
 source venv/bin/activate
