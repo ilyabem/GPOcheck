@@ -1,6 +1,6 @@
 
 
-# 🔍 GPOCheck
+# GPOCheck
 
 **Active Directory Group Policy Object Security Analyzer**
 
