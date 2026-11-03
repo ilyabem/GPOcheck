@@ -1,11 +1,8 @@
-
-
 # GPOCheck
 
 **Active Directory Group Policy Object Security Analyzer**
 
-GPOCheck подключается к контроллеру домена, читает файлы GPO из SYSVOL и выявляет небезопасные настройки политик — политику паролей, блокировки, RDP, SMB, сертификаты и многое другое. Дополнительно выводит статистику пользователей и групп домена.
-
+GPOCheck читает групповые политики домена (объекты GPO в LDAP и файлы в SYSVOL) и выявляет небезопасные настройки: слабую политику паролей, отключённую защиту протоколов, пароли в Group Policy Preferences, опасные привилегии, избыточные права на изменение GPO. Дополнительно проверяет учётные записи домена.
 
 За основу взят и глубоко доработан [GPOHunter](https://github.com/PShlyundin/GPOHunter).
 
@@ -15,24 +12,28 @@ GPOCheck подключается к контроллеру домена, чит
 
 | Категория | Что проверяет |
 |-----------|---------------|
-| **Политика паролей** | Сложность, минимальная длина, возраст, история |
-| **Политика блокировки** | Порог попыток, длительность, сброс счётчика |
-| **Хеши и шифрование** | LM-хеши, WDigest, обратимое шифрование (ClearText) |
-| **Протоколы** | SMBv1, Netlogon signing, LDAP signing |
-| **RDP** | NLA (Network Level Authentication), пароль при входе |
-| **Привилегии** | AlwaysInstallElevated, AutoLogon |
-| **Сертификаты** | EFS blob — DER/ASN.1 декодирование внутри Registry.pol |
-| **Пользователи** | Кол-во по группам, отключённые учётки, пользователи без групп |
+| **Политика паролей** | Действующая политика домена (из объекта домена, а не из «первой попавшейся» GPO), FGPP, сложность, длина, возраст, история, блокировка |
+| **Хеши и учётные данные** | LM-хеши, LmCompatibilityLevel, WDigest, обратимое шифрование, пароль автовхода в GPO, RunAsPPL, CredSSP |
+| **Протоколы** | SMBv1, подпись SMB, подпись и channel binding LDAP, защита канала Netlogon (ZeroLogon), DES/RC4 в Kerberos, WinRM, LLMNR |
+| **RDP** | NLA, уровень безопасности и шифрования, запрос пароля |
+| **Повышение привилегий** | AlwaysInstallElevated, UAC, LocalAccountTokenFilterPolicy, Point and Print (PrintNightmare) |
+| **Защитные механизмы** | Отключение Defender и брандмауэра, исключения Defender, журналирование PowerShell |
+| **Права и группы** | Опасные привилегии (SeDebug, SeBackup, SeImpersonate…) у широких групп, Restricted Groups, добавление в локальные администраторы через GPP |
+| **Group Policy Preferences** | `cpassword` (MS14-025), задачи планировщика, параметры реестра из Registry.xml, сценарии входа/запуска |
+| **Объекты GPO** | Кто может изменять GPO (ACL), владелец, несвязанные и отключённые GPO, расхождение версий AD и SYSVOL |
+| **Учётные записи** (`--users`) | AS-REP roasting, Kerberoasting, неограниченное делегирование, PASSWD_NOTREQD, бессрочные пароли администраторов, неактивные учётки, возраст пароля krbtgt, состав привилегированных групп с учётом вложенности |
 
-### Корректное декодирование GPO файлов
+Проверки реестра учитывают **значение** параметра (например, `SMB1=0` — это не уязвимость) и одинаково применяются к `Registry.pol`, секции `[Registry Values]` в `GptTmpl.inf` и `Registry.xml` из GPP.
+
+### Декодирование файлов GPO
 
 | Файл | Формат | Обработка |
 |------|--------|-----------|
-| `GptTmpl.inf` | UTF-16 LE (BOM) | Автоопределение кодировки |
-| `Registry.pol` | Бинарный PReg | Полный парсер всех типов REG_* |
-| EFS / сертификаты | DER/ASN.1 | Поиск и декодирование внутри blob |
-| `*.xml`, `*.cmtx` | UTF-8 / UTF-16 | Автоопределение |
-| Прочие бинарники | — | Hex dump (не мусор в терминале) |
+| `GptTmpl.inf`, `GPT.INI`, `scripts.ini` | UTF-16 LE/BE, UTF-8, cp1251 | Автоопределение кодировки, разбор по секциям |
+| `Registry.pol` | Бинарный PReg | Строгий парсер всех типов REG_*, восстановление после повреждённых записей |
+| EFS / сертификаты | DER/ASN.1 | Поиск и декодирование сертификатов внутри blob |
+| `*.xml` (GPP), `*.cmtx` | UTF-8 / UTF-16 | Разбор XML |
+| Прочие бинарные файлы | — | Hex dump |
 
 ---
 
@@ -42,162 +43,160 @@ GPOCheck подключается к контроллеру домена, чит
 git clone https://github.com/ilyabem/GPOCheck.git
 cd GPOCheck
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**Зависимости:**
+Требуется Python 3.10+. Для Kerberos на Linux дополнительно нужен пакет `gssapi` (`pip install gssapi`, требует системных библиотек Kerberos) и билет `kinit`.
 
-```
-ldap3>=2.9.1
-impacket>=0.11.0
-cryptography>=41.0.0
-pycryptodome>=3.19.0
-```
+> **Ошибка `unsupported hash type MD4`** — OpenSSL 3.x отключил MD4, который нужен для NTLM. `pycryptodome` из requirements.txt его предоставляет.
 
-> **Ubuntu 22.04+**: если получаете ошибку `unsupported hash type MD4` — установите `pycryptodome`:
-> ```bash
-> pip install pycryptodome
-> ```
-> OpenSSL 3.x отключил MD4, который нужен для NTLM-аутентификации. `pycryptodome` предоставляет его напрямую.
+> **Антивирус удаляет файлы.** Некоторые антивирусы (замечено у Kaspersky) эвристически считают инструменты аудита AD хакерскими и удаляют их. Добавьте каталог GPOCheck в исключения.
 
 ---
 
 ## Использование
 
-### Базовый запуск (интерактивный ввод порогов)
+### Windows: текущий сеанс домена
+
+Если машина в домене, учётные данные не нужны: используется Kerberos текущего пользователя, SYSVOL читается по UNC-пути через указанный DC.
 
 ```bash
-python gpo_analyzer_cli.py \
-  -u administrator \
-  -p 'Password123!' \
-  -d corp.local \
-  -dc 192.168.1.10 \
-  --show-xml
+python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local
 ```
 
-При запуске скрипт задаст вопросы о порогах политики:
+Для Kerberos указывайте **имя** DC (FQDN), а не IP-адрес.
 
-```
-=== Настройка порогов политики безопасности ===
-
-  — Политика паролей —
-  Минимальная длина пароля            [12]: 14
-  Требовать сложность пароля (1=да)   [1]:
-  Максимальный возраст пароля (дни)   [90]: 60
-
-  — Политика блокировки —
-  Попыток до блокировки               [5]: 3
-  Длительность блокировки (мин)       [15]:
-```
-
-### Быстрый запуск без вопросов
+### Логин и пароль (NTLM)
 
 ```bash
-python gpo_analyzer_cli.py \
-  -u administrator -p 'Password123!' \
-  -d corp.local -dc 192.168.1.10 \
-  --no-prompt
+python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local -u auditor
 ```
 
-### Пороги через аргументы
+Пароль будет запрошен без отображения (можно передать `-p`, но тогда он попадёт в историю командной строки). Имя пользователя можно указать как `user`, `CORP\user` или `user@corp.local`. SYSVOL читается по SMB.
+
+Если DC требует подпись LDAP, скрипт сам переключится на LDAPS (636). Принудительно: `--ldaps`.
+
+### Linux: Kerberos
 
 ```bash
-python gpo_analyzer_cli.py \
-  -u administrator -p 'Password123!' \
-  -d corp.local -dc 192.168.1.10 \
-  --no-prompt \
-  --min-pwd-len 14 \
-  --max-pwd-age 60 \
-  --lockout-count 3
+kinit auditor@CORP.LOCAL
+python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local -k
 ```
 
-### Статистика пользователей и групп
+### Офлайн-анализ копии SYSVOL
+
+Скопируйте каталог `\\corp.local\SYSVOL\corp.local\Policies` и проверьте его без подключения к AD:
 
 ```bash
-python gpo_analyzer_cli.py \
-  -u administrator -p 'Password123!' \
-  -d corp.local -dc 192.168.1.10 \
-  --no-prompt \
-  --users
+python gpo_analyzer_cli.py --offline ./Policies
 ```
 
-С детальным списком участников каждой группы:
+В офлайн-режиме пороги паролей проверяются по Default Domain Policy; связи GPO и права на объекты недоступны.
+
+### Пользователи, отчёт, CI
 
 ```bash
-python gpo_analyzer_cli.py ... --users --show-members
+python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local \
+  --users --show-members --json report.json --fail-on HIGH --no-prompt
 ```
 
-### Всё вместе
+`--fail-on HIGH` возвращает код 2, если найдено хотя бы одно замечание HIGH или CRITICAL.
+
+### Пороги политики паролей
+
+При запуске в терминале скрипт спросит пороги (Enter — значение по умолчанию). Без вопросов: `--no-prompt`; при перенаправлении ввода/вывода вопросы не задаются. Пороги можно задать аргументами:
 
 ```bash
-python gpo_analyzer_cli.py \
-  -u administrator -p 'Password123!' \
-  -d corp.local -dc 192.168.1.10 \
-  --show-xml --users --show-members \
-  --min-pwd-len 14 --lockout-count 3 --no-prompt
+python gpo_analyzer_cli.py ... --no-prompt --min-pwd-len 14 --max-pwd-age 0 --lockout-count 5
 ```
+
+`--max-pwd-age 0` отключает проверку срока действия пароля (допустимо при длинных паролях и MFA, см. NIST 800-63B).
 
 ---
 
 ## Пример вывода
 
 ```
-GPOCheck v1.0.0 — Active Directory GPO Security Analyzer
+GPOCheck v2.0.0 — Active Directory GPO Security Analyzer
 
-[+] Подключено к Active Directory
-[+] Найдено GPO: 5
+[+] Подключено к dc01.corp.local (LDAP, Kerberos) как CORP\auditor
+[+] Найдено GPO: 10, связей (gPLink): 7
 
-=== Сводка политики паролей ===
-  ──────────────────────────────────────────────────
-  Сложность пароля                    Включена ✓
-  Мин. длина пароля                   7
-  Макс. возраст (дни)                 42
-  Мин. возраст (дни)                  1
-  История паролей                     24
-  Порог блокировки (попыток)          0
-  Хранить пароли открыто              0
-  Отключить LM-хеши                   1
+=== Политика паролей ===
 
-=== Security Analysis ===
+  Действующая политика домена (атрибуты объекта домена)
+  ────────────────────────────────────────────────────────────
+    Сложность пароля                   включена ✓
+    Мин. длина пароля                  7
+    Порог блокировки (попыток)         0 (блокировка отключена)
+
+  GPO «Password Policy» — связь с корнем домена ОТКЛЮЧЕНА
+  ...
+
+=== Результаты проверки ===
+
+  [HIGH] RDP без NLA (Network Level Authentication)
+    GPO    : Remote Access Policy
+    Файл   : Machine\Registry.pol
+    Данные : MACHINE\Software\Policies\Microsoft\Windows NT\Terminal Services\UserAuthentication = 0
+    Суть   : UserAuthentication=0: сеанс создаётся до аутентификации ...
 
   [HIGH] Слабая минимальная длина пароля (7 < 12)
-    GPO  : Default Domain Policy
-    Файл : MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf
-    Инфо : MinimumPasswordLength=7, требуется ≥12
+    GPO    : Политика домена (действующая)
+    Данные : MinimumPasswordLength = 7
 
-  [HIGH] Блокировка учётной записи отключена (LockoutBadCount=0)
-    GPO  : Default Domain Policy
-    Файл : MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf
-    Инфо : Возможен неограниченный перебор пароля (brute-force)
-
-  Итого:  2 HIGH
-
-=== Отчёт по пользователям и группам ===
-
-  Пользователи:
-    Всего      : 120
-    Активные   : 115
-    Отключённые: 5
-
-  Состав групп:
-  ─────────────────────────────────────────────────
-  Группа           Тип                 Польз
-  Accounting       Security / Global     100  ████████████
-  IT               Security / Global      10  ██████████
-  Domain Admins    Security / Global       5  █████
+  Итого:  2 HIGH  |  1 MEDIUM  |  3 LOW
+  Не показано замечаний ниже уровня LOW: 5 (см. --min-severity)
 ```
 
 ---
 
 ## Уровни severity
 
-| Уровень | Цвет | Описание |
-|---------|------|----------|
-| `CRITICAL` | 🔴 Красный | Немедленное исправление — прямая угроза безопасности |
-| `HIGH` | 🟡 Жёлтый | Серьёзная уязвимость, требует исправления |
-| `MEDIUM` | 🔵 Синий | Отклонение от best practices |
-| `LOW` | 🟢 Зелёный | Незначительный риск, рекомендуется проверить |
+| Уровень | Описание |
+|---------|----------|
+| `CRITICAL` | Прямая компрометация: пароли в GPO, изменение GPO широкой группой, обратимое шифрование |
+| `HIGH` | Серьёзная уязвимость, требует исправления |
+| `MEDIUM` | Отклонение от best practices с реальным риском |
+| `LOW` | Незначительный риск, рекомендуется проверить |
+| `INFO` | Сведения для аудитора (задачи, сценарии, несвязанные GPO); по умолчанию скрыты, показать: `--min-severity INFO` |
+
+---
+
+## Все аргументы
+
+```
+Подключение:
+  -d, --domain        DNS-имя домена
+  -dc, --dc           IP или имя контроллера домена (по умолчанию — имя домена)
+  -u, --username      Пользователь (NTLM)
+  -p, --password      Пароль (если не указан — будет запрошен)
+  -k, --kerberos      Kerberos: текущий сеанс Windows или KRB5CCNAME (Linux)
+  --ldaps             LDAPS (636)
+  --ldap-port N       Нестандартный порт LDAP
+  --smb-port N        Порт SMB (445)
+  --timeout N         Таймаут подключения, сек (10)
+  --sysvol-path DIR   Читать файлы GPO из каталога Policies вместо SMB
+  --offline DIR       Офлайн-анализ каталога Policies
+
+Что проверять и выводить:
+  --gpo NAME          Фильтр по имени или GUID GPO
+  --show-xml          Показать декодированное содержимое файлов GPO (синоним --show-files)
+  --users             Пользователи, группы и проверки учётных записей
+  --show-members      Участники групп
+  --stale-days N      Порог неактивности учётных записей (90)
+  --no-acl            Не проверять права на объекты GPO
+  --min-severity LVL  Минимальный выводимый уровень (LOW)
+  --json FILE         Полный отчёт в JSON
+  --fail-on LVL       Код возврата 2 при замечаниях уровня LVL и выше
+  --no-prompt         Не задавать вопросов
+  --no-color          Без цветов (также переменная NO_COLOR)
+
+Пороги:
+  --min-pwd-len N  --max-pwd-age N  --min-pwd-age N  --pwd-history N
+  --lockout-count N  --lockout-duration N  --lockout-reset N
+```
 
 ---
 
@@ -205,61 +204,33 @@ GPOCheck v1.0.0 — Active Directory GPO Security Analyzer
 
 ```
 GPOCheck/
-├── gpo_analyzer_cli.py   # Основной CLI
-├── gpo_decoders.py       # Декодеры GPO файлов (GptTmpl, Registry.pol, DER)
-├── gpo_users.py          # Модуль статистики пользователей и групп
-├── test_decoders.py      # Офлайн-тесты декодеров
-├── requirements.txt
-├── setup.sh
-└── README.md
+├── gpo_analyzer_cli.py   # CLI: аргументы и сценарий запуска
+├── gpo_checks.py         # Проверки безопасности (без сети)
+├── gpo_decoders.py       # Декодеры файлов GPO (INF, Registry.pol, сертификаты)
+├── gpo_ldap.py           # LDAP: подключение, GPO, связи, политика паролей, ACL
+├── gpo_sysvol.py         # Чтение SYSVOL: SMB, UNC, локальный каталог
+├── gpo_users.py          # Пользователи, группы, проверки учётных записей
+├── gpo_report.py         # Консольный вывод и JSON
+└── tests/                # Тесты (не требуют AD)
 ```
 
 ---
 
-## Все аргументы CLI
-
-```
-python gpo_analyzer_cli.py --help
-
-  -u, --username      Имя пользователя AD
-  -p, --password      Пароль
-  -d, --domain        Домен (например corp.local)
-  -dc, --dc           IP или hostname контроллера домена
-
-  --show-xml          Показать содержимое файлов GPO
-  --gpo NAME          Фильтровать по имени GPO
-  --users             Показать статистику пользователей и групп
-  --show-members      Показать участников каждой группы
-  --no-prompt         Не задавать вопросов, использовать дефолты
-  --no-color          Отключить ANSI-цвета (для pipe/grep)
-  --version           Показать версию
-
-Пороги:
-  --min-pwd-len N     Минимальная длина пароля (по умолч. 12)
-  --max-pwd-age N     Максимальный возраст пароля в днях (по умолч. 90)
-  --min-pwd-age N     Минимальный возраст пароля в днях (по умолч. 1)
-  --lockout-count N   Порог неверных попыток до блокировки (по умолч. 5)
-```
-
----
-
-## Офлайн-тесты
-
-Проверить корректность декодеров без подключения к AD:
+## Тесты
 
 ```bash
-python test_decoders.py
+python -m unittest discover -s tests -t tests
 ```
 
-Ожидаемый результат: все тесты PASS.
+Тесты не требуют контроллера домена: LDAP эмулируется mock-стратегией ldap3, SMB — локальным сервером impacket на 127.0.0.1.
 
 ---
 
-## Требования
+## Требования к правам
 
-- Python 3.10+
-- Учётная запись домена с правами на чтение GPO и SYSVOL
-- Сетевой доступ к контроллеру домена (порты 389/LDAP, 445/SMB)
+- Любая учётная запись домена: чтение GPO, SYSVOL, политики домена, пользователей и групп.
+- FGPP по умолчанию читаются только администраторами домена.
+- Сетевой доступ к DC: 389/636 (LDAP/LDAPS), 445 (SMB), 88 (Kerberos).
 
 ---
 

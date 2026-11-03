@@ -1,4 +1,7 @@
 ldap3>=2.9.1
 impacket>=0.11.0
-cryptography>=41.0.0
+cryptography>=42.0.0
+# MD4 для NTLM: в OpenSSL 3.x он отключён, ldap3 берёт его из pycryptodome
 pycryptodome>=3.19.0
+# Kerberos/SSPI текущего сеанса Windows (-k)
+winkerberos>=0.9.0; sys_platform == "win32"
