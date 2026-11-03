@@ -4,590 +4,384 @@ GPOCheck — Active Directory GPO Security Analyzer
 https://github.com/ilyabem/GPOCheck
 """
 
+from __future__ import annotations
+
 import argparse
-import sys
+import getpass
+import os
 import re
-import struct
-from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
-from ldap3.core.exceptions import LDAPException
+import sys
+from datetime import datetime, timezone
 
-from gpo_decoders import (
-    decode_gpttmpl, parse_registry_pol, decode_certificate,
-    display_gpo_file, is_binary, hexdump,
+from gpo_decoders import decode_text, parse_inf, inf_get, render_gpo_file
+from gpo_checks import (
+    Finding, SEVERITIES, SEV_ORDER, check_gpo_file, check_password_policy, default_thresholds,
+    inf_password_policy, sort_findings,
 )
-from gpo_users import (
-    get_all_users, get_all_groups, build_user_report, print_user_report,
+from gpo_report import (
+    C, setup_streams, setup_colors, ok, warn, err, info, ask_thresholds, is_interactive, print_policy, gpo_status,
+    print_findings, write_json,
 )
+from gpo_sysvol import FsSysvol, SmbSysvol, offline_gpos
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+DEFAULT_DOMAIN_POLICY_GUID = "{31B2F340-016D-11D2-945F-00C04FB984F9}"
 
-# ── ANSI цвета ────────────────────────────────────────────────────────────────
-class C:
-    OK   = "\033[92m"
-    WARN = "\033[93m"
-    ERR  = "\033[91m"
-    INFO = "\033[94m"
-    BOLD = "\033[1m"
-    DIM  = "\033[2m"
-    RST  = "\033[0m"
-
-def ok(msg):   print(f"{C.OK}[+]{C.RST} {msg}")
-def warn(msg): print(f"{C.WARN}[!]{C.RST} {msg}")
-def err(msg):  print(f"{C.ERR}[-]{C.RST} {msg}")
-def info(msg): print(f"{C.INFO}[*]{C.RST} {msg}")
-def dim(msg):  print(f"{C.DIM}{msg}{C.RST}")
-
-
-# ── Интерактивный ввод порогов ────────────────────────────────────────────────
-def _ask_int(prompt: str, default: int, lo: int = 0, hi: int = 99999) -> int:
-    while True:
-        try:
-            raw = input(f"  {prompt} [{default}]: ").strip()
-            if raw == "":
-                return default
-            v = int(raw)
-            if lo <= v <= hi:
-                return v
-            print(f"    Введите число от {lo} до {hi}")
-        except ValueError:
-            print("    Ожидается целое число")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return default
-
-
-def ask_thresholds() -> dict:
-    print(f"\n{C.BOLD}=== Настройка порогов политики безопасности ==={C.RST}")
-    print(f"  {C.DIM}Нажмите Enter чтобы принять значение по умолчанию{C.RST}\n")
-
-    print(f"  {C.BOLD}— Политика паролей —{C.RST}")
-    t = {}
-    t["min_password_length"] = _ask_int(
-        "Минимальная длина пароля            (предупреждение если МЕНЬШЕ)",  12, 0, 128)
-    t["require_complexity"]  = _ask_int(
-        "Требовать сложность пароля          (1=да, 0=нет — предупреждение если 0)",  1, 0, 1)
-    t["min_password_age"]    = _ask_int(
-        "Минимальный возраст пароля (дни)    (предупреждение если МЕНЬШЕ)",   1, 0, 998)
-    t["max_password_age"]    = _ask_int(
-        "Максимальный возраст пароля (дни)   (предупреждение если БОЛЬШЕ, 0=без лимита)", 90, 0, 999)
-    t["password_history"]    = _ask_int(
-        "История паролей                     (предупреждение если МЕНЬШЕ)",  10, 0, 24)
-
-    print(f"\n  {C.BOLD}— Политика блокировки —{C.RST}")
-    t["lockout_threshold"]   = _ask_int(
-        "Попыток до блокировки               (предупреждение если БОЛЬШЕ или 0=откл)",  5, 0, 999)
-    t["lockout_duration"]    = _ask_int(
-        "Длительность блокировки (мин)       (предупреждение если МЕНЬШЕ, 0=навсегда)", 15, 0, 99999)
-    t["reset_lockout_count"] = _ask_int(
-        "Сброс счётчика попыток (мин)        (предупреждение если МЕНЬШЕ)",  15, 0, 99999)
-    print()
-    return t
-
-
-def _default_thresholds(**overrides) -> dict:
-    t = {
-        "min_password_length": 12,
-        "require_complexity":   1,
-        "min_password_age":     1,
-        "max_password_age":    90,
-        "password_history":    10,
-        "lockout_threshold":    5,
-        "lockout_duration":    15,
-        "reset_lockout_count": 15,
-    }
-    t.update({k: v for k, v in overrides.items() if v is not None})
-    return t
-
-
-# ── Парсинг значений из GptTmpl.inf ──────────────────────────────────────────
-def _inf_val(content: str, key: str) -> int | None:
-    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(\d+)", content,
-                  re.MULTILINE | re.IGNORECASE)
-    return int(m.group(1)) if m else None
-
-
-def _reg_dword(content: str, value_name: str) -> int | None:
-    m = re.search(
-        rf"Value\s*:\s*{re.escape(value_name)}.*?Data\s*:\s*(\d+)",
-        content, re.IGNORECASE | re.DOTALL,
-    )
-    return int(m.group(1)) if m else None
-
-
-# ── Сводка политики паролей (информационный блок) ────────────────────────────
-def _password_policy_summary(filename: str, content: str) -> list[tuple]:
-    """
-    Возвращает список (label, value, status) для информационной таблицы
-    политики паролей. Вызывается один раз на весь прогон.
-    """
-    if not filename.lower().endswith("gpttmpl.inf"):
-        return []
-
-    rows = []
-
-    # Сложность пароля — всегда показываем явно
-    complexity = _inf_val(content, "PasswordComplexity")
-    if complexity is not None:
-        if complexity == 1:
-            rows.append(("Сложность пароля", "Включена ✓", "ok"))
-        else:
-            rows.append(("Сложность пароля", "ОТКЛЮЧЕНА ✗", "warn"))
-    else:
-        rows.append(("Сложность пароля", "не задана в GPO", "dim"))
-
-    for key, label in [
-        ("MinimumPasswordLength",  "Мин. длина пароля"),
-        ("MaximumPasswordAge",     "Макс. возраст (дни)"),
-        ("MinimumPasswordAge",     "Мин. возраст (дни)"),
-        ("PasswordHistorySize",    "История паролей"),
-        ("LockoutBadCount",        "Порог блокировки (попыток)"),
-        ("LockoutDuration",        "Длительность блокировки (мин)"),
-        ("ResetLockoutCount",      "Сброс счётчика (мин)"),
-        ("ClearTextPassword",      "Хранить пароли открыто"),
-        ("NoLMHash",               "Отключить LM-хеши"),
-    ]:
-        v = _inf_val(content, key)
-        if v is not None:
-            rows.append((label, str(v), "info"))
-
-    return rows
-
-
-def print_policy_summary(summaries: list[tuple], C) -> None:
-    """Красиво вывести сводную таблицу политики паролей."""
-    if not summaries:
-        return
-    print(f"\n{C.BOLD}=== Сводка политики паролей ==={C.RST}")
-    print(f"  {'─'*50}")
-    for label, value, status in summaries:
-        if status == "ok":
-            val_str = f"{C.OK}{value}{C.RST}"
-        elif status == "warn":
-            val_str = f"{C.WARN}{value}{C.RST}"
-        elif status == "dim":
-            val_str = f"{C.DIM}{value}{C.RST}"
-        else:
-            val_str = f"{C.INFO}{value}{C.RST}"
-        print(f"  {label:<35} {val_str}")
-    print()
-
-
-# ── Статические security checks ───────────────────────────────────────────────
-_STATIC_CHECKS = [
-    ("LM hashes enabled",      "gpttmpl.inf",  "NoLMHash=4,0",            "HIGH",
-     "Хранение LM-хешей включено — уязвимость для Pass-the-Hash атак"),
-    ("ClearText passwords",    "gpttmpl.inf",  "ClearTextPassword = 1",   "CRITICAL",
-     "Пароли хранятся в обратимом шифровании (равносильно открытому тексту)"),
-    ("Autologon configured",   "registry.pol", "AutoAdminLogon",          "CRITICAL",
-     "Настроен автовход — проверьте DefaultPassword в реестре"),
-    ("WDigest enabled",        "registry.pol", "UseLogonCredential",      "HIGH",
-     "WDigest хранит пароли в открытом виде в LSASS — уязвимость для Mimikatz"),
-    ("SMBv1 enabled",          "registry.pol", "SMB1",                    "HIGH",
-     "Устаревший протокол SMBv1 активен (EternalBlue, WannaCry)"),
-    ("AlwaysInstallElevated",  "registry.pol", "AlwaysInstallElevated",   "CRITICAL",
-     "MSI-пакеты запускаются с привилегиями SYSTEM — локальное повышение привилегий"),
-    ("LDAP signing weak",      "gpttmpl.inf",  "LDAPServerIntegrity=4,1", "MEDIUM",
-     "LDAP подпись запрашивается но не обязательна (должно быть =4,2)"),
-    ("Netlogon signing off",   "gpttmpl.inf",  "RequireSignOrSeal=4,0",   "HIGH",
-     "Netlogon не требует подписи — уязвимость ZeroLogon"),
-]
-
-
-def run_static_checks(filename: str, content: str) -> list:
-    issues = []
-    fl = filename.lower()
-    for name, suffix, pattern, severity, desc in _STATIC_CHECKS:
-        if not fl.endswith(suffix):
-            continue
-        if pattern.lower() not in content.lower():
-            continue
-        # RDP NLA: UserAuthentication должен быть именно 0
-        if pattern == "UserAuthentication":
-            if _reg_dword(content, "UserAuthentication") != 0:
-                continue
-        # fPromptForPassword = 0 → проблема
-        if pattern == "fPromptForPassword":
-            if _reg_dword(content, "fPromptForPassword") != 0:
-                continue
-        issues.append((severity, name, desc))
-    return issues
-
-
-# ── Пороговые security checks ─────────────────────────────────────────────────
-def run_threshold_checks(filename: str, content: str, t: dict) -> list:
-    issues = []
-    if not filename.lower().endswith("gpttmpl.inf"):
-        return issues
-
-    # Сложность пароля
-    complexity = _inf_val(content, "PasswordComplexity")
-    if complexity is not None:
-        if complexity == 0 and t.get("require_complexity", 1) == 1:
-            issues.append((
-                "HIGH",
-                "Сложность пароля отключена (PasswordComplexity=0)",
-                "Пользователи могут устанавливать простые пароли без спецсимволов, "
-                "цифр и смешанного регистра",
-            ))
-    else:
-        # Параметр вообще не задан в GPO — тоже потенциальный риск
-        issues.append((
-            "LOW",
-            "Политика сложности пароля не определена в GPO",
-            "PasswordComplexity не найден — применяются настройки по умолчанию ОС",
-        ))
-
-    # Минимальная длина
-    v = _inf_val(content, "MinimumPasswordLength")
-    if v is not None and v < t["min_password_length"]:
-        issues.append((
-            "HIGH",
-            f"Слабая минимальная длина пароля ({v} < {t['min_password_length']})",
-            f"MinimumPasswordLength={v}, требуется ≥{t['min_password_length']}",
-        ))
-
-    # Минимальный возраст
-    v = _inf_val(content, "MinimumPasswordAge")
-    if v is not None and v < t["min_password_age"]:
-        issues.append((
-            "MEDIUM",
-            f"Минимальный возраст пароля слишком мал ({v} дн < {t['min_password_age']})",
-            f"MinimumPasswordAge={v} — пользователи могут менять пароль сразу обратно",
-        ))
-
-    # Максимальный возраст
-    v = _inf_val(content, "MaximumPasswordAge")
-    if v is not None:
-        if v == 0:
-            issues.append((
-                "HIGH",
-                "Срок действия пароля не ограничен (MaximumPasswordAge=0)",
-                "Пароль никогда не истекает — скомпрометированный пароль действует вечно",
-            ))
-        elif t["max_password_age"] > 0 and v > t["max_password_age"]:
-            issues.append((
-                "MEDIUM",
-                f"Слишком долгий срок действия пароля ({v} дн > {t['max_password_age']})",
-                f"MaximumPasswordAge={v}, рекомендуется ≤{t['max_password_age']}",
-            ))
-
-    # История паролей
-    v = _inf_val(content, "PasswordHistorySize")
-    if v is not None and v < t["password_history"]:
-        issues.append((
-            "MEDIUM",
-            f"Маленькая история паролей ({v} < {t['password_history']})",
-            f"PasswordHistorySize={v} — пользователи быстро возвращаются к старым паролям",
-        ))
-
-    # Порог блокировки
-    v = _inf_val(content, "LockoutBadCount")
-    if v is not None:
-        if v == 0:
-            issues.append((
-                "HIGH",
-                "Блокировка учётной записи отключена (LockoutBadCount=0)",
-                "Возможен неограниченный перебор пароля (brute-force)",
-            ))
-        elif v > t["lockout_threshold"]:
-            issues.append((
-                "MEDIUM",
-                f"Высокий порог блокировки ({v} попыток > {t['lockout_threshold']})",
-                f"LockoutBadCount={v}, рекомендуется ≤{t['lockout_threshold']}",
-            ))
-
-    # Длительность блокировки
-    v = _inf_val(content, "LockoutDuration")
-    if v is not None and t["lockout_duration"] > 0 and 0 < v < t["lockout_duration"]:
-        issues.append((
-            "MEDIUM",
-            f"Короткая длительность блокировки ({v} мин < {t['lockout_duration']})",
-            f"LockoutDuration={v}, рекомендуется ≥{t['lockout_duration']} или 0 (навсегда)",
-        ))
-
-    # Сброс счётчика
-    v = _inf_val(content, "ResetLockoutCount")
-    if v is not None and v < t["reset_lockout_count"]:
-        issues.append((
-            "LOW",
-            f"Быстрый сброс счётчика попыток ({v} мин < {t['reset_lockout_count']})",
-            f"ResetLockoutCount={v}, рекомендуется ≥{t['reset_lockout_count']}",
-        ))
-
-    return issues
-
-
-def run_all_checks(filename: str, content: str, thresholds: dict) -> list:
-    return run_static_checks(filename, content) + \
-           run_threshold_checks(filename, content, thresholds)
-
-
-# ── LDAP / AD ─────────────────────────────────────────────────────────────────
-def connect_ad(dc: str, domain: str, username: str, password: str) -> Connection:
-    server = Server(dc, get_info=ALL)
-    conn = Connection(
-        server, user=f"{domain}\\{username}", password=password,
-        authentication=NTLM, auto_bind=True,
-    )
-    return conn
-
-
-def get_base_dn(domain: str) -> str:
-    return ",".join(f"DC={p}" for p in domain.split("."))
-
-
-def get_gpos(conn: Connection, base_dn: str) -> list:
-    conn.search(
-        search_base=f"CN=Policies,CN=System,{base_dn}",
-        search_filter="(objectClass=groupPolicyContainer)",
-        search_scope=SUBTREE,
-        attributes=["displayName", "cn", "gPCFileSysPath",
-                    "versionNumber", "flags", "whenCreated", "whenChanged"],
-    )
-    return conn.entries
-
-
-# ── SYSVOL через SMB ──────────────────────────────────────────────────────────
-def read_sysvol_files(gpo_entry, dc: str, domain: str,
-                      username: str, password: str) -> dict:
-    files = {}
-    try:
-        from impacket.smbconnection import SMBConnection
-        import io
-
-        smb = SMBConnection(dc, dc)
-        smb.login(username, password, domain)
-
-        sysvol_path = str(gpo_entry.gPCFileSysPath)
-        parts  = sysvol_path.replace("\\\\", "").split("\\")
-        share  = parts[1]
-        folder = "\\".join(parts[2:])
-
-        def list_dir(path):
-            try:
-                for f in smb.listPath(share, path + "\\*"):
-                    name = f.get_longname()
-                    if name in (".", ".."):
-                        continue
-                    full = path + "\\" + name
-                    if f.is_directory():
-                        list_dir(full)
-                    else:
-                        buf = io.BytesIO()
-                        smb.getFile(share, full, buf.write)
-                        rel = full[len(folder):].lstrip("\\")
-                        files[rel] = buf.getvalue()
-            except Exception:
-                pass
-
-        list_dir(folder)
-        smb.logoff()
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    return files
-
-
-# ── CLI аргументы ─────────────────────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(
-        description=f"GPOCheck v{VERSION} — Active Directory GPO Security Analyzer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+EPILOG = """
 Примеры:
-  # Анализ GPO с интерактивным вводом порогов:
-  python gpo_analyzer_cli.py -u admin -p 'Pass123!' -d corp.local -dc 192.168.1.1 --show-xml
+  # Пароль будет запрошен без отображения:
+  python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local -u auditor
 
-  # Быстрый анализ с дефолтами + статистика пользователей:
-  python gpo_analyzer_cli.py -u admin -p 'Pass123!' -d corp.local -dc 192.168.1.1 \\
-    --no-prompt --users --show-members
+  # Windows, текущий сеанс домена (Kerberos/SSPI), SYSVOL читается по UNC-пути:
+  python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local -k --users
 
-  # Задать пороги через аргументы:
-  python gpo_analyzer_cli.py -u admin -p 'Pass123!' -d corp.local -dc 192.168.1.1 \\
-    --no-prompt --min-pwd-len 14 --max-pwd-age 60 --lockout-count 3
-        """,
-    )
-    p.add_argument("-u",  "--username",     required=True,  help="Имя пользователя AD")
-    p.add_argument("-p",  "--password",     required=True,  help="Пароль")
-    p.add_argument("-d",  "--domain",       required=True,  help="Домен (например corp.local)")
-    p.add_argument("-dc", "--dc",           required=True,  help="IP или hostname контроллера домена")
-    p.add_argument("--show-xml",            action="store_true",
-                   help="Показать содержимое файлов GPO")
-    p.add_argument("--gpo",                 default=None,
-                   help="Фильтровать по имени GPO (substring)")
-    p.add_argument("--users",               action="store_true",
-                   help="Показать статистику пользователей и групп")
-    p.add_argument("--show-members",        action="store_true",
-                   help="Показать участников каждой группы (используется с --users)")
-    p.add_argument("--no-prompt",           action="store_true",
-                   help="Не задавать интерактивных вопросов, использовать дефолты")
-    p.add_argument("--no-color",            action="store_true",
-                   help="Отключить ANSI-цвета")
-    p.add_argument("--version",             action="version", version=f"GPOCheckr {VERSION}")
-    # Пороги через аргументы
-    g = p.add_argument_group("Пороги (переопределяют интерактивный ввод)")
-    g.add_argument("--min-pwd-len",    type=int, metavar="N",
-                   help="Минимальная длина пароля (по умолч. 12)")
-    g.add_argument("--max-pwd-age",    type=int, metavar="N",
-                   help="Максимальный возраст пароля в днях (по умолч. 90)")
-    g.add_argument("--min-pwd-age",    type=int, metavar="N",
-                   help="Минимальный возраст пароля в днях (по умолч. 1)")
-    g.add_argument("--lockout-count",  type=int, metavar="N",
-                   help="Порог неверных попыток до блокировки (по умолч. 5)")
-    return p.parse_args()
+  # Linux, билет Kerberos из kinit (KRB5CCNAME):
+  python gpo_analyzer_cli.py -d corp.local -dc dc01.corp.local -k
+
+  # Офлайн-анализ копии каталога SYSVOL\\<домен>\\Policies:
+  python gpo_analyzer_cli.py --offline ./Policies
+
+  # Без вопросов, свои пороги, отчёт в JSON:
+  python gpo_analyzer_cli.py -d corp.local -dc 10.0.0.1 -u auditor --no-prompt \\
+      --min-pwd-len 14 --lockout-count 5 --json report.json
+"""
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    args = parse_args()
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog="gpo_analyzer_cli.py",
+        description=f"GPOCheck v{VERSION} — анализ безопасности групповых политик Active Directory",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EPILOG)
 
-    if args.no_color:
-        for attr in vars(C):
-            if not attr.startswith("_"):
-                setattr(C, attr, "")
+    a = p.add_argument_group("Подключение")
+    a.add_argument("-d", "--domain", help="DNS-имя домена (например corp.local)")
+    a.add_argument("-dc", "--dc", help="IP или имя контроллера домена (по умолчанию — имя домена)")
+    a.add_argument("-u", "--username", help="Пользователь: user, DOMAIN\\user или user@domain")
+    a.add_argument("-p", "--password", help="Пароль (если не указан — будет запрошен)")
+    a.add_argument("-k", "--kerberos", action="store_true",
+                   help="Kerberos: текущий сеанс Windows или билет KRB5CCNAME (Linux)")
+    a.add_argument("--ldaps", action="store_true", help="Подключаться по LDAPS (636)")
+    a.add_argument("--ldap-port", type=int, help="Нестандартный порт LDAP")
+    a.add_argument("--smb-port", type=int, default=445, help="Порт SMB (по умолчанию 445)")
+    a.add_argument("--timeout", type=int, default=10, help="Таймаут подключения, сек (по умолчанию 10)")
+    a.add_argument("--sysvol-path", metavar="DIR",
+                   help="Читать файлы GPO из каталога Policies (локальная копия или UNC) вместо SMB")
+    a.add_argument("--offline", metavar="DIR", help="Офлайн-анализ каталога Policies без подключения к AD")
 
-    print(f"\n{C.BOLD}GPOCheck v{VERSION}{C.RST} — Active Directory GPO Security Analyzer\n")
+    o = p.add_argument_group("Что проверять и выводить")
+    o.add_argument("--gpo", help="Фильтр по имени или GUID GPO (подстрока)")
+    o.add_argument("--show-xml", "--show-files", dest="show_files", action="store_true",
+                   help="Показать декодированное содержимое файлов GPO")
+    o.add_argument("--users", action="store_true", help="Пользователи и группы + проверки учётных записей")
+    o.add_argument("--show-members", action="store_true", help="Показать участников групп (с --users)")
+    o.add_argument("--stale-days", type=int, default=90, help="Порог неактивности учётных записей, дни (90)")
+    o.add_argument("--no-acl", action="store_true", help="Не проверять права на объекты GPO")
+    o.add_argument("--min-severity", type=str.upper, choices=SEVERITIES, default="LOW",
+                   help="Минимальный уровень выводимых замечаний (по умолчанию LOW)")
+    o.add_argument("--json", metavar="FILE", help="Сохранить полный отчёт в JSON")
+    o.add_argument("--fail-on", type=str.upper, choices=SEVERITIES,
+                   help="Код возврата 2, если есть замечания этого уровня или выше (для CI)")
+    o.add_argument("--no-prompt", action="store_true", help="Не задавать вопросов, пороги по умолчанию")
+    o.add_argument("--no-color", action="store_true", help="Отключить цвета")
+    o.add_argument("--version", action="version", version=f"GPOCheck {VERSION}")
 
-    # ── Пороги ───────────────────────────────────────────────────────────────
-    if args.no_prompt:
-        thresholds = _default_thresholds(
-            min_password_length=args.min_pwd_len,
-            min_password_age=args.min_pwd_age,
-            max_password_age=args.max_pwd_age,
-            lockout_threshold=args.lockout_count,
-        )
-    else:
-        thresholds = ask_thresholds()
-        if args.min_pwd_len   is not None: thresholds["min_password_length"] = args.min_pwd_len
-        if args.min_pwd_age   is not None: thresholds["min_password_age"]    = args.min_pwd_age
-        if args.max_pwd_age   is not None: thresholds["max_password_age"]    = args.max_pwd_age
-        if args.lockout_count is not None: thresholds["lockout_threshold"]   = args.lockout_count
+    t = p.add_argument_group("Пороги (переопределяют значения по умолчанию и интерактивный ввод)")
+    t.add_argument("--min-pwd-len", type=int, metavar="N", help="Минимальная длина пароля (12)")
+    t.add_argument("--max-pwd-age", type=int, metavar="N", help="Макс. возраст пароля, дни; 0 — не проверять (90)")
+    t.add_argument("--min-pwd-age", type=int, metavar="N", help="Мин. возраст пароля, дни (1)")
+    t.add_argument("--pwd-history", type=int, metavar="N", help="История паролей (10)")
+    t.add_argument("--lockout-count", type=int, metavar="N", help="Порог неверных попыток до блокировки (5)")
+    t.add_argument("--lockout-duration", type=int, metavar="N", help="Длительность блокировки, мин (15)")
+    t.add_argument("--lockout-reset", type=int, metavar="N", help="Сброс счётчика попыток, мин (15)")
 
-    info(
-        f"Пороги: длина≥{thresholds['min_password_length']}  "
-        f"сложность={'вкл' if thresholds['require_complexity'] else 'выкл'}  "
-        f"макс.возраст≤{thresholds['max_password_age']}дн  "
-        f"блокировка≤{thresholds['lockout_threshold']} попыток"
-    )
+    args = p.parse_args(argv)
 
-    # ── Подключение к AD ──────────────────────────────────────────────────────
+    if args.offline:
+        if not os.path.isdir(args.offline):
+            p.error(f"--offline: каталог не найден: {args.offline}")
+        if args.users:
+            p.error("--users требует подключения к AD и несовместим с --offline")
+        return args
+
+    if not args.domain:
+        p.error("укажите домен (-d) или --offline DIR")
+    args.dc = args.dc or args.domain
+    if args.username and args.kerberos:
+        p.error("укажите либо -u (NTLM), либо -k (Kerberos)")
+    if not args.username and not args.kerberos:
+        if os.name == "nt":
+            args.kerberos = True          # текущий сеанс Windows
+        else:
+            p.error("укажите -u USER (NTLM) или -k (Kerberos, нужен kinit)")
+    if args.username and args.password is None:
+        args.password = getpass.getpass(f"Пароль для {args.username}: ")
+    return args
+
+
+def collect_thresholds(args) -> dict:
+    t = default_thresholds()
+    if not args.no_prompt and is_interactive():
+        t = ask_thresholds(t)
+    t.update({k: v for k, v in {
+        "min_password_length": args.min_pwd_len, "max_password_age": args.max_pwd_age,
+        "min_password_age": args.min_pwd_age, "password_history": args.pwd_history,
+        "lockout_threshold": args.lockout_count, "lockout_duration": args.lockout_duration,
+        "reset_lockout_count": args.lockout_reset,
+    }.items() if v is not None})
+    return t
+
+
+class Context:
+    """Данные, собранные из AD (в офлайн-режиме остаются пустыми)."""
+
+    def __init__(self):
+        self.conn = None
+        self.base_dn = ""
+        self.links: dict = {}
+        self.resolver: dict = {}
+        self.domain_policy: dict | None = None
+        self.fgpp: list = []
+
+
+def load_from_ad(args, ctx: Context, findings: list, thresholds: dict):
+    """Подключиться к AD и собрать GPO, связи, политику паролей. -> список GPO или None при ошибке."""
+    from gpo_ldap import (ConnectError, connect_ad, get_base_dn, get_domain_info, get_fgpp, get_gpos,
+                          get_gpo_links, gpo_acl_writers, resolve_sids)
+
+    if args.kerberos and re.fullmatch(r"[\d.]+|[0-9a-fA-F:]+", args.dc):
+        warn("Для Kerberos укажите имя DC (FQDN), а не IP-адрес: SPN строится по имени")
     try:
-        conn = connect_ad(args.dc, args.domain, args.username, args.password)
-        ok("Подключено к Active Directory")
-    except LDAPException as e:
-        err(f"LDAP ошибка подключения: {e}")
-        sys.exit(1)
+        ctx.conn = connect_ad(args, on_fallback=lambda: warn(
+            "Контроллер домена требует подпись LDAP — переключаюсь на LDAPS (636)"))
+    except ConnectError as e:
+        err(f"Не удалось подключиться к LDAP {args.dc}: {e}")
+        if "invalidCredentials" in str(e):
+            err("Неверное имя пользователя или пароль")
+        return None
+    except OSError as e:
+        err(f"Сетевая ошибка: {e}")
+        return None
 
-    base_dn = get_base_dn(args.domain)
+    who = (ctx.conn.extend.standard.who_am_i() or "").replace("u:", "")
+    ok(f"Подключено к {args.dc} ({'LDAPS' if args.ldaps else 'LDAP'}, "
+       f"{'Kerberos' if args.kerberos else 'NTLM'}) как {who}")
 
-    # ── Перечисление GPO ──────────────────────────────────────────────────────
-    gpos = get_gpos(conn, base_dn)
-    ok(f"Найдено GPO: {len(gpos)}")
+    other = ctx.conn.server.info.other if ctx.conn.server.info else {}
+    ctx.base_dn = (other.get("defaultNamingContext") or [get_base_dn(args.domain)])[0]
+    config_nc = (other.get("configurationNamingContext") or [None])[0]
+
+    ctx.domain_policy, _, maq = get_domain_info(ctx.conn, ctx.base_dn)
+    ctx.fgpp = get_fgpp(ctx.conn, ctx.base_dn)
+    gpos = get_gpos(ctx.conn, ctx.base_dn)
+    ctx.links = get_gpo_links(ctx.conn, ctx.base_dn, config_nc)
+    ok(f"Найдено GPO: {len(gpos)}, связей (gPLink): {sum(len(v) for v in ctx.links.values())}")
+
+    if ctx.domain_policy:
+        findings += check_password_policy(ctx.domain_policy, thresholds, "Политика домена (действующая)")
+    for pso in ctx.fgpp:
+        findings += check_password_policy(pso["policy"], thresholds, f"FGPP: {pso['name']}")
+    if maq:
+        findings.append(Finding("LOW", f"Пользователи могут добавлять компьютеры в домен (квота {maq})",
+                                "ms-DS-MachineAccountQuota > 0: любой пользователь создаёт учётные записи "
+                                "компьютеров (используется в атаках RBCD/noPac). Рекомендуется 0.",
+                                "", "", f"ms-DS-MachineAccountQuota = {maq}", "Домен"))
+
+    if not args.no_acl:
+        sids = set()
+        for g in gpos:
+            if g["sd"]:
+                try:
+                    owner, writers = gpo_acl_writers(g["sd"])
+                    sids |= set(writers) | {owner}
+                except Exception:
+                    pass
+        ctx.resolver = resolve_sids(ctx.conn, ctx.base_dn, sids)
+    return gpos
+
+
+def gpo_link_findings(g: dict, g_links: list) -> list:
+    if g["flags"] == 3:
+        return [Finding("INFO", "GPO полностью отключена", "Политика не применяется.", g["name"])]
+    if not g_links:
+        return [Finding("INFO", "GPO не связана ни с одним контейнером",
+                        "Политика не применяется; удалите её, если она не нужна.", g["name"])]
+    if not any(en for _, en, _ in g_links):
+        return [Finding("INFO", "Все связи GPO отключены", "Политика не применяется.", g["name"])]
+    return []
+
+
+def run(args) -> int:
+    print(f"\n{C.BOLD}GPOCheck v{VERSION}{C.RST} — Active Directory GPO Security Analyzer\n")
+    thresholds = collect_thresholds(args)
+    info(f"Пороги: длина≥{thresholds['min_password_length']}  "
+         f"макс. возраст≤{thresholds['max_password_age'] or '∞'} дн  история≥{thresholds['password_history']}  "
+         f"блокировка≤{thresholds['lockout_threshold']} попыток / ≥{thresholds['lockout_duration']} мин")
+
+    findings: list = []
+    ctx = Context()
+    report = {"tool": "GPOCheck", "version": VERSION, "generated": datetime.now(timezone.utc),
+              "thresholds": thresholds, "gpos": []}
+
+    if args.offline:
+        report["mode"] = "offline"
+        reader = FsSysvol(root=args.offline)
+        gpos = offline_gpos(args.offline)
+        ok(f"Офлайн-режим: {args.offline}, найдено GPO: {len(gpos)}")
+    else:
+        report.update(mode="ldap", domain=args.domain, dc=args.dc)
+        gpos = load_from_ad(args, ctx, findings, thresholds)
+        if gpos is None:
+            return 1
+        report["base_dn"] = ctx.base_dn
+        if args.sysvol_path:
+            reader = FsSysvol(root=args.sysvol_path)
+        elif args.kerberos and os.name == "nt":
+            reader = FsSysvol(dc=args.dc)          # UNC-путь от имени текущего пользователя
+        else:
+            reader = SmbSysvol(args)
 
     if args.gpo:
-        gpos = [g for g in gpos
-                if args.gpo.lower() in str(getattr(g, "displayName", "")).lower()]
-        info(f"Фильтр: {len(gpos)} GPO совпадают с '{args.gpo}'")
+        flt = args.gpo.lower()
+        gpos = [g for g in gpos if flt in g["name"].lower() or flt in g["guid"].lower()]
+        info(f"Фильтр '{args.gpo}': {len(gpos)} GPO")
 
-    all_issues   = []   # [(gpo_name, filepath, severity, name, desc)]
-    all_summaries = []  # [(label, value, status)]  — для сводки политики
+    # ── Обработка GPO ─────────────────────────────────────────────────────────
+    gpo_policies = []        # [(gpo, связи, политика паролей из GptTmpl.inf, путь)]
+    unreadable = 0
+    try:
+        for g in gpos:
+            g_links = ctx.links.get(g["guid"], [])
+            entry = {"name": g["name"], "guid": g["guid"], "path": g["path"], "status": gpo_status(g),
+                     "links": [{"dn": dn, "enabled": en, "enforced": enf} for dn, en, enf in g_links]}
+            report["gpos"].append(entry)
 
-    if args.show_xml:
-        print(f"\n{C.BOLD}=== GPO File Contents ==={C.RST}")
+            if args.show_files:
+                print(f"\n{C.BOLD}{'═' * 70}{C.RST}")
+                ok(f"GPO: {g['name']} {g['guid']}  [{gpo_status(g)}]")
 
-    for gpo_entry in gpos:
-        gpo_name = str(gpo_entry.displayName) if hasattr(gpo_entry, "displayName") else "Unknown"
-        gpo_guid = str(gpo_entry.cn)          if hasattr(gpo_entry, "cn")          else "Unknown"
+            if not args.offline:
+                findings += gpo_link_findings(g, g_links)
+                if not args.no_acl:
+                    from gpo_ldap import check_gpo_acl
+                    findings += check_gpo_acl(g, ctx.resolver)
 
-        if args.show_xml:
-            print(f"\n{C.BOLD}{'='*60}{C.RST}")
-            ok(f"GPO: {gpo_name} ({gpo_guid})")
+            try:
+                files, errors = reader.read_gpo(g)
+            except Exception as e:
+                err(f"Не удалось прочитать SYSVOL ({args.dc}): {type(e).__name__}: {e}")
+                return 1
+            entry["files"], entry["errors"] = sorted(files), errors
+            if errors and not files:
+                unreadable += 1
+            if args.show_files:
+                for e in errors:
+                    warn(e)
 
-        sysvol_files = read_sysvol_files(
-            gpo_entry, args.dc, args.domain, args.username, args.password,
-        )
+            gpt_ini = next((files[k] for k in files if k.lower() == "gpt.ini"), None)
+            if gpt_ini and not args.offline:
+                try:
+                    fs_version = int(inf_get(parse_inf(decode_text(gpt_ini)), "General", "Version") or 0)
+                except ValueError:
+                    fs_version = None
+                if fs_version is not None and fs_version != g["version"]:
+                    findings.append(Finding("LOW", "Версия GPO в AD и SYSVOL не совпадает",
+                                            "Возможна незавершённая репликация SYSVOL (DFSR) или повреждение GPO.",
+                                            g["name"], "GPT.INI",
+                                            f"AD versionNumber={g['version']}, GPT.INI Version={fs_version}"))
 
-        if not sysvol_files:
-            if args.show_xml:
-                warn("Файлы SYSVOL недоступны (нет impacket или прав доступа)")
-            continue
+            for rel in sorted(files):
+                raw = files[rel]
+                if args.show_files:
+                    print(f"\n  {C.BOLD}── {rel}{C.RST} ({len(raw)} байт)")
+                    print(render_gpo_file(rel, raw))
+                findings += check_gpo_file(rel, raw, g["name"], ctx.resolver)
+                if rel.lower().endswith("gpttmpl.inf"):
+                    pol = inf_password_policy(parse_inf(decode_text(raw)))
+                    if pol:
+                        gpo_policies.append((g, g_links, pol, rel))
+    finally:
+        reader.close()
 
-        for rel_path, raw_bytes in sorted(sysvol_files.items()):
-            if args.show_xml:
-                display_gpo_file(rel_path, raw_bytes)
+    if unreadable:
+        warn(f"Файлы SYSVOL недоступны для {unreadable} GPO (права или путь; подробности: --show-files)")
 
-            fl = rel_path.lower()
-            if fl.endswith("gpttmpl.inf"):
-                decoded = decode_gpttmpl(raw_bytes)
-            elif fl.endswith("registry.pol"):
-                decoded = parse_registry_pol(raw_bytes)
-            else:
-                decoded = raw_bytes.decode("utf-8", errors="replace")
+    # ── Политика паролей ──────────────────────────────────────────────────────
+    print(f"\n{C.BOLD}=== Политика паролей ==={C.RST}")
+    if ctx.domain_policy:
+        print_policy("Действующая политика домена (атрибуты объекта домена)", ctx.domain_policy)
+    for pso in ctx.fgpp:
+        print_policy(f"FGPP «{pso['name']}» (приоритет {pso['precedence']}, объектов: {len(pso['applies_to'])})",
+                     pso["policy"])
+    if not args.offline and not ctx.fgpp:
+        print(f"\n  {C.DIM}FGPP (Fine-Grained Password Policies) не найдены или нет прав на чтение{C.RST}")
 
-            # Сводка политики паролей (только из GptTmpl.inf)
-            rows = _password_policy_summary(rel_path, decoded)
-            if rows:
-                all_summaries.extend(rows)
+    root = ctx.base_dn.lower()
+    for g, g_links, pol, rel in gpo_policies:
+        at_root = [en for dn, en, _ in g_links if dn.lower() == root]
+        if args.offline:
+            note = ""
+        elif any(at_root):
+            note = " — связана с корнем домена"
+        elif at_root:
+            note = " — связь с корнем домена ОТКЛЮЧЕНА"
+        else:
+            note = " — не связана с корнем домена"
+        print_policy(f"GPO «{g['name']}»{note}", pol)
+        if args.offline:
+            if g["guid"] == DEFAULT_DOMAIN_POLICY_GUID:
+                findings += check_password_policy(pol, thresholds, g["name"], rel)
+        elif not any(at_root):
+            findings.append(Finding("INFO", "Параметры паролей в GPO не действуют для доменных учётных записей",
+                                    "Политику паролей домена задают только GPO, связанные с корнем домена; "
+                                    "здесь параметры влияют лишь на локальные учётные записи компьютеров.",
+                                    g["name"], rel, ", ".join(f"{k}={v}" for k, v in pol.items())))
+    if args.offline and not any(g["guid"] == DEFAULT_DOMAIN_POLICY_GUID for g, *_ in gpo_policies):
+        print(f"\n  {C.DIM}Default Domain Policy не найдена — пороговые проверки паролей пропущены{C.RST}")
 
-            # Security checks
-            for severity, issue_name, desc in run_all_checks(rel_path, decoded, thresholds):
-                all_issues.append((gpo_name, rel_path, severity, issue_name, desc))
-
-    # ── Сводка политики паролей ───────────────────────────────────────────────
-    if all_summaries:
-        # Дедупликация: оставить первое вхождение каждого label
-        seen = set()
-        deduped = []
-        for row in all_summaries:
-            if row[0] not in seen:
-                seen.add(row[0])
-                deduped.append(row)
-        print_policy_summary(deduped, C)
-
-    # ── Security report ───────────────────────────────────────────────────────
-    print(f"{C.BOLD}=== Security Analysis ==={C.RST}")
-
-    if not all_issues:
-        ok("Проблем безопасности не обнаружено")
-    else:
-        sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        all_issues.sort(key=lambda x: sev_order.get(x[2], 9))
-
-        sev_color = {
-            "CRITICAL": C.ERR,
-            "HIGH":     C.WARN,
-            "MEDIUM":   C.INFO,
-            "LOW":      C.OK,
+    # ── Пользователи ──────────────────────────────────────────────────────────
+    if args.users and ctx.conn is not None:
+        from gpo_users import (get_all_users, get_all_groups, get_privileged_members, build_user_report,
+                               check_accounts, print_user_report)
+        info("Загружаю пользователей и группы...")
+        users = get_all_users(ctx.conn, ctx.base_dn)
+        groups = get_all_groups(ctx.conn, ctx.base_dn)
+        ur = build_user_report(users, groups, get_privileged_members(ctx.conn, ctx.base_dn, groups),
+                               args.stale_days)
+        findings += check_accounts(ur)
+        print_user_report(ur, C, show_members=args.show_members)
+        report["users"] = {
+            "total": ur["total"], "enabled": ur["enabled"], "disabled": ur["disabled"],
+            "stale": sorted(u["sam"] for u in ur["stale"]), "privileged": ur["privileged"],
+            "groups": [{k: g[k] for k in ("name", "type", "user_count", "users")} for g in ur["groups"]],
         }
-        counts = {}
-        for gpo_name, path, severity, issue_name, desc in all_issues:
-            counts[severity] = counts.get(severity, 0) + 1
-            col = sev_color.get(severity, "")
-            print(f"\n  {col}[{severity}]{C.RST} {C.BOLD}{issue_name}{C.RST}")
-            print(f"    GPO  : {gpo_name}")
-            print(f"    Файл : {path}")
-            print(f"    Инфо : {desc}")
 
-        print(f"\n{C.BOLD}  Итого:{C.RST}", end="  ")
-        parts = []
-        for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-            if counts.get(sev, 0):
-                parts.append(f"{sev_color[sev]}{counts[sev]} {sev}{C.RST}")
-        print("  |  ".join(parts))
+    if ctx.conn is not None:
+        ctx.conn.unbind()
 
-    # ── Отчёт по пользователям ────────────────────────────────────────────────
-    if args.users:
-        info("Загружаю пользователей и группы из AD...")
-        all_users  = get_all_users(conn, base_dn)
-        all_groups = get_all_groups(conn, base_dn)
-        report = build_user_report(all_users, all_groups)
-        report["all_users"] = all_users
-        print_user_report(report, C, show_members=args.show_members)
-
-    conn.unbind()
+    findings = sort_findings(findings)
+    print_findings(findings, args.min_severity)
+    report["password_policy"] = {"domain": ctx.domain_policy, "fgpp": ctx.fgpp}
+    report["findings"] = [f.to_dict() for f in findings]
+    if args.json:
+        write_json(args.json, report)
+        ok(f"JSON-отчёт сохранён: {args.json}")
     print()
+
+    if args.fail_on and any(SEV_ORDER[f.severity] <= SEV_ORDER[args.fail_on] for f in findings):
+        return 2
+    return 0
+
+
+def main(argv=None) -> int:
+    setup_streams()
+    args = parse_args(argv)
+    setup_colors(args.no_color)
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        err("Прервано пользователем")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

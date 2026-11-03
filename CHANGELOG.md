@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.0.0] — 2026-11-02
+
+### Исправлено
+- Ложные срабатывания: SMBv1, WDigest, AlwaysInstallElevated, AutoLogon помечались уязвимыми
+  по одному упоминанию имени, даже когда параметр выключен. Теперь проверяется значение.
+- Парсер `Registry.pol` терял записи после REG_BINARY нечётной длины (на реальных файлах —
+  до половины записей, включая параметры RDP). Новый строгий парсер с ресинхронизацией.
+- Политика паролей бралась из первой попавшейся GPO. Теперь действующая политика читается
+  из объекта домена; GPO, не связанные с корнем домена, помечаются как недействующие.
+- `MaximumPasswordAge = -1` / `LockoutDuration = -1` не распознавались.
+- Пользователи и группы: без постраничного поиска AD отдавал не больше 1000 объектов;
+  основная группа (Domain Users) не учитывалась, из-за чего почти все попадали в «без групп».
+- Падение на консоли Windows (cp866/cp1251) при выводе ✓/█/─.
+- Ошибки SMB проглатывались молча; новое SMB-соединение открывалось на каждую GPO.
+- `cryptography < 42` падал на `not_valid_before_utc`.
+- Проверки RDP (NLA, запрос пароля), заявленные в README, фактически не выполнялись.
+
+### Добавлено
+- ~60 проверок реестра (LDAP signing/channel binding, Netlogon/ZeroLogon, PrintNightmare,
+  Defender, брандмауэр, UAC, WinRM, Kerberos DES/RC4, LLMNR и др.) для Registry.pol,
+  `[Registry Values]` GptTmpl.inf и Registry.xml (GPP).
+- Group Policy Preferences: `cpassword` (MS14-025), задачи планировщика, Groups.xml, сценарии.
+- Опасные привилегии и Restricted Groups в GptTmpl.inf.
+- Права на объекты GPO (кто может изменять), связи GPO (gPLink), несвязанные/отключённые GPO,
+  расхождение версий AD и SYSVOL, FGPP, ms-DS-MachineAccountQuota.
+- Проверки учётных записей (`--users`): AS-REP roasting, Kerberoasting, делегирование,
+  PASSWD_NOTREQD, krbtgt, неактивные и привилегированные учётные записи.
+- Kerberos (`-k`): текущий сеанс Windows (SSPI) или KRB5CCNAME на Linux; на Windows без
+  учётных данных используется текущий сеанс.
+- LDAPS (`--ldaps`) и автоматический переход на него, если DC требует подпись LDAP.
+- Офлайн-анализ копии каталога Policies (`--offline`), `--sysvol-path`.
+- `--json`, `--fail-on`, `--min-severity`, уровень INFO, запрос пароля без отображения.
+- Тесты `tests/` (84 теста, без AD: mock LDAP, локальный SMB-сервер).
+
+### Изменено
+- Код разделён на модули: `gpo_checks`, `gpo_ldap`, `gpo_sysvol`, `gpo_report`.
+- `-u`/`-p` больше не обязательны (запрос пароля / Kerberos).
+
 ## [1.0.0] — 2025-05-25
 
 ### Добавлено
